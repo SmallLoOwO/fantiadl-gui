@@ -47,6 +47,23 @@ dl_group.add_argument("-n", "--download-new-posts", dest="download_new_posts", m
 dl_group.add_argument("-d", "--download-month", dest="month_limit", metavar="%Y-%m", help="download posts only from a specific month, e.g. 2007-08 (excludes -n)")
 dl_group.add_argument("--exclude", dest="exclude_file", metavar="EXCLUDE_FILE", help="file containing a list of filenames to exclude from downloading")
 
+retry_group = cmdl_parser.add_argument_group("retry options")
+retry_group.add_argument("--max-retries", dest="max_retries", type=int, default=10, help="max urllib3 retries per request (default: 10)")
+retry_group.add_argument("--retry-backoff", dest="retry_backoff", type=float, default=3, help="urllib3 backoff factor: delay = factor * (2 ** (n-1)) (default: 3)")
+retry_group.add_argument("--retry-backoff-max", dest="retry_backoff_max", type=float, default=120, help="cap on a single urllib3 retry sleep in seconds (default: 120)")
+retry_group.add_argument("--cooldown-seconds", dest="cooldown_seconds", type=int, default=60, help="base cooldown wait in seconds when inner retries exhaust; scales linearly with cooldown attempt count (default: 60)")
+retry_group.add_argument("--cooldown-attempts", dest="cooldown_attempts", type=int, default=10, help="how many outer cooldown rounds to try before giving up on a post / file (default: 10)")
+retry_group.add_argument("--sleep-request", dest="sleep_request", type=float, default=0.0, help="sleep this many seconds before EVERY HTTP request; preventative throttle to avoid 429 in the first place (default: 0)")
+
+verify_group = cmdl_parser.add_argument_group("verify options")
+verify_group.add_argument("--verify", action="store_true", dest="verify", help="cross-check a fanclub URL against the DB to find missing/incomplete posts (requires --db). On its own this prints a report. Adds an auto-fix download pass by default; pass --verify-no-fix to skip it.")
+verify_group.add_argument("--verify-json", dest="verify_json", metavar="PATH", help="write the verify report to this JSON file (defaults to verify_<fanclub_id>.json next to the cwd)")
+verify_group.add_argument("--verify-no-fix", action="store_true", dest="verify_no_fix", help="report only; do not redownload incomplete posts")
+
+naming_group = cmdl_parser.add_argument_group("naming options")
+naming_group.add_argument("--post-directory-format", dest="post_directory_format", default="{post_id}_{post_title}", help="format string for per-post folder name. Fields: {post_id} {post_title} {post_creator} {fanclub_id}. Default: '{post_id}_{post_title}'. Pass '{post_id}' to restore old ID-only behavior.")
+naming_group.add_argument("--max-title-length", dest="max_title_length", type=int, default=80, help="truncate the formatted folder name to this many characters to keep Windows MAX_PATH safe (default: 80; 0 disables)")
+
 
 cmdl_opts = cmdl_parser.parse_args()
 
@@ -78,7 +95,7 @@ def main():
     #         password = getpass.getpass("Password: ")
 
     try:
-        downloader = FantiaDownloader(session_arg=session_arg, dump_metadata=cmdl_opts.dump_metadata, parse_for_external_links=cmdl_opts.parse_for_external_links, download_thumb=cmdl_opts.download_thumb, directory=cmdl_opts.output_path, quiet=cmdl_opts.quiet, continue_on_error=cmdl_opts.continue_on_error, use_server_filenames=cmdl_opts.use_server_filenames, mark_incomplete_posts=cmdl_opts.mark_incomplete_posts, month_limit=cmdl_opts.month_limit, exclude_file=cmdl_opts.exclude_file, db_path=cmdl_opts.db_path, db_bypass_post_check=cmdl_opts.db_bypass_post_check)
+        downloader = FantiaDownloader(session_arg=session_arg, dump_metadata=cmdl_opts.dump_metadata, parse_for_external_links=cmdl_opts.parse_for_external_links, download_thumb=cmdl_opts.download_thumb, directory=cmdl_opts.output_path, quiet=cmdl_opts.quiet, continue_on_error=cmdl_opts.continue_on_error, use_server_filenames=cmdl_opts.use_server_filenames, mark_incomplete_posts=cmdl_opts.mark_incomplete_posts, month_limit=cmdl_opts.month_limit, exclude_file=cmdl_opts.exclude_file, db_path=cmdl_opts.db_path, db_bypass_post_check=cmdl_opts.db_bypass_post_check, max_retries=cmdl_opts.max_retries, retry_backoff=cmdl_opts.retry_backoff, retry_backoff_max=cmdl_opts.retry_backoff_max, cooldown_seconds=cmdl_opts.cooldown_seconds, cooldown_attempts=cmdl_opts.cooldown_attempts, sleep_request=cmdl_opts.sleep_request, post_directory_format=cmdl_opts.post_directory_format, max_title_length=cmdl_opts.max_title_length)
         if cmdl_opts.download_fanclubs:
             try:
                 downloader.download_followed_fanclubs(limit=cmdl_opts.limit)
@@ -119,8 +136,19 @@ def main():
                             url_groups = url_match.groups()
                             if url_groups[0] == "fanclubs":
                                 fanclub = FantiaClub(url_groups[1])
-                                downloader.download_fanclub(fanclub, cmdl_opts.limit)
+                                if cmdl_opts.verify:
+                                    verify_json_path = cmdl_opts.verify_json or "verify_{}.json".format(fanclub.id)
+                                    downloader.verify_fanclub(
+                                        fanclub,
+                                        output_json=verify_json_path,
+                                        auto_fix=not cmdl_opts.verify_no_fix,
+                                        limit=cmdl_opts.limit,
+                                    )
+                                else:
+                                    downloader.download_fanclub(fanclub, cmdl_opts.limit)
                             elif url_groups[0] == "posts":
+                                if cmdl_opts.verify:
+                                    downloader.output("--verify only applies to fanclub URLs (got a post URL). Ignoring --verify and downloading the post normally.\n")
                                 downloader.download_post(url_groups[1])
                         except KeyboardInterrupt:
                             raise

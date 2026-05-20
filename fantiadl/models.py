@@ -67,7 +67,7 @@ class FantiaClub:
 
 
 class FantiaDownloader:
-    def __init__(self, session_arg, chunk_size=1024 * 1024 * 5, dump_metadata=False, parse_for_external_links=False, download_thumb=False, directory=None, quiet=True, continue_on_error=False, use_server_filenames=False, mark_incomplete_posts=False, month_limit=None, exclude_file=None, db_path=None, db_bypass_post_check=False):
+    def __init__(self, session_arg, chunk_size=1024 * 1024 * 5, dump_metadata=False, parse_for_external_links=False, download_thumb=False, directory=None, quiet=True, continue_on_error=False, use_server_filenames=False, mark_incomplete_posts=False, month_limit=None, exclude_file=None, db_path=None, db_bypass_post_check=False, max_retries=10, retry_backoff=3, retry_backoff_max=120, cooldown_seconds=60, cooldown_attempts=10, sleep_request=0.0, post_directory_format="{post_id}_{post_title}", max_title_length=80):
         # self.email = email
         # self.password = password
         self.session_arg = session_arg
@@ -85,10 +85,72 @@ class FantiaDownloader:
         self.exclusions = []
         self.db = FantiaDlDatabase(db_path)
         self.db_bypass_post_check = db_bypass_post_check
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+        self.retry_backoff_max = retry_backoff_max
+        self.cooldown_seconds = cooldown_seconds
+        self.cooldown_attempts = cooldown_attempts
+        self.sleep_request = sleep_request
+        self.post_directory_format = post_directory_format
+        self.max_title_length = max_title_length
 
         self.initialize_session()
         self.login()
         self.create_exclusions()
+
+    def _format_post_directory_title(self, post_id, post_title, post_creator, fanclub_id):
+        """Build the per-post folder name from self.post_directory_format.
+
+        Each field is sanitized before being inserted, so titles containing
+        slashes / illegal chars cannot escape the intended directory level.
+        """
+        clean_title = sanitize_for_path((post_title or "").strip())
+        fields = {
+            "post_id": str(post_id),
+            "post_title": clean_title,
+            "post_creator": sanitize_for_path(post_creator or ""),
+            "fanclub_id": str(fanclub_id) if fanclub_id is not None else "",
+        }
+        try:
+            name = self.post_directory_format.format(**fields)
+        except (KeyError, IndexError) as e:
+            self.output("Invalid --post-directory-format ({}). Falling back to post id.\n".format(e))
+            name = str(post_id)
+
+        # If the title was empty, common patterns end up with a dangling
+        # separator like "4055902_". Trim them so we don't get ugly names.
+        if not clean_title:
+            name = re.sub(r"[\s_\-]+$", "", name) or str(post_id)
+
+        name = sanitize_for_path(name)
+        if self.max_title_length and len(name) > self.max_title_length:
+            name = name[:self.max_title_length].rstrip()
+            # Re-strip trailing dots/spaces produced by truncation
+            name = re.sub(r'[\s.]+$', '', name) or str(post_id)
+        return name
+
+    def _cooldown_retry(self, label, func, *args, **kwargs):
+        """Run func(*args, **kwargs); on RetryError / connection failures, cool down and retry."""
+        attempt = 0
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except KeyboardInterrupt:
+                raise
+            except (requests.exceptions.RetryError,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.Timeout) as e:
+                attempt += 1
+                if attempt > self.cooldown_attempts:
+                    self.output("Cooldown attempts exhausted for {} ({} attempts). Giving up.\n".format(label, self.cooldown_attempts))
+                    raise
+                wait = self.cooldown_seconds * attempt
+                self.output("\nRate limited / connection error on {}: {}\nCooling down for {}s before retrying (cooldown attempt {}/{})...\n".format(label, type(e).__name__, wait, attempt, self.cooldown_attempts))
+                try:
+                    time.sleep(wait)
+                except KeyboardInterrupt:
+                    raise
 
     def output(self, output):
         """Write output to the console."""
@@ -106,15 +168,35 @@ class FantiaDownloader:
         self.session = requests.session()
         self.session.headers.update({"User-Agent": USER_AGENT})
         retries = Retry(
-            total=5,
-            connect=5,
-            read=5,
+            total=self.max_retries,
+            connect=self.max_retries,
+            read=self.max_retries,
+            status=self.max_retries,
             status_forcelist=[429, 500, 502, 503, 504, 507, 508],
-            backoff_factor=2, # retry delay = {backoff factor} * (2 ** ({retry number} - 1))
+            allowed_methods=None,  # retry on all HTTP methods
+            backoff_factor=self.retry_backoff, # retry delay = {backoff factor} * (2 ** ({retry number} - 1))
+            respect_retry_after_header=True,
             raise_on_status=True
         )
+        # backoff_max caps the per-retry sleep (urllib3 >= 1.26 uses attribute; older versions use class attr)
+        try:
+            retries.backoff_max = self.retry_backoff_max
+        except Exception:
+            pass
         self.session.mount("http://", HTTPAdapter(max_retries=retries))
         self.session.mount("https://", HTTPAdapter(max_retries=retries))
+
+        # Optional throttle: sleep before every top-level request to prevent 429.
+        # Hooked on session.send so urllib3-level retries (inside HTTPAdapter.send)
+        # are not double-counted.
+        if self.sleep_request and self.sleep_request > 0:
+            _original_send = self.session.send
+
+            def _send_with_sleep(request, **kwargs):
+                time.sleep(self.sleep_request)
+                return _original_send(request, **kwargs)
+
+            self.session.send = _send_with_sleep
 
     def login(self):
         """Login to Fantia using the provided email and password."""
@@ -219,6 +301,187 @@ class FantiaDownloader:
             background_filename = os.path.join(fanclub_directory, "background" + self.process_content_type(background_url))
             self.output("Downloading fanclub background...\n")
             self.perform_download(background_url, background_filename, use_server_filename=self.use_server_filenames)
+
+    def verify_fanclub(self, fanclub, output_json=None, auto_fix=True, limit=0):
+        """Cross-check a fanclub's posts against local DB and report what's missing.
+
+        Requires --db. Walks every post listed on the fanclub page, fetches its
+        API to enumerate expected file URLs, and compares each against the
+        `urls` table. Optionally redownloads anything that is incomplete.
+        """
+        if not self.db.conn:
+            self.output("--verify requires --db <path>. Without a DB there is nothing to cross-check against. Aborting verify.\n")
+            return None
+
+        self.output("Verifying fanclub {}...\n".format(fanclub.id))
+        post_ids = self.fetch_fanclub_posts(fanclub)
+        if limit:
+            post_ids = post_ids[:limit]
+
+        report_posts = []
+        counts = {"complete": 0, "incomplete": 0, "locked": 0, "error": 0}
+
+        for idx, post_id in enumerate(post_ids):
+            self.output("  [{}/{}] Verifying post {}...\n".format(idx + 1, len(post_ids), post_id))
+            try:
+                entry = self._cooldown_retry(
+                    "verify post {}".format(post_id),
+                    self._verify_post_inner,
+                    post_id,
+                )
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                self.output("    Error verifying post {}: {}\n".format(post_id, e))
+                entry = {
+                    "post_id": str(post_id),
+                    "post_url": POST_URL.format(post_id),
+                    "status": "error",
+                    "error": "{}: {}".format(type(e).__name__, e),
+                }
+            report_posts.append(entry)
+            counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+
+        summary = {
+            "total_posts": len(post_ids),
+            "complete": counts.get("complete", 0),
+            "incomplete": counts.get("incomplete", 0),
+            "locked": counts.get("locked", 0),
+            "error": counts.get("error", 0),
+        }
+        report = {
+            "fanclub_id": str(fanclub.id),
+            "fanclub_url": "https://fantia.jp/fanclubs/{}".format(fanclub.id),
+            "verified_at": dt.utcnow().isoformat() + "Z",
+            "summary": summary,
+            "posts": report_posts,
+        }
+
+        self.output("\n=== Verification report for fanclub {} ===\n".format(fanclub.id))
+        self.output("Total posts on server : {}\n".format(summary["total_posts"]))
+        self.output("  Complete            : {}\n".format(summary["complete"]))
+        self.output("  Incomplete (missing): {}\n".format(summary["incomplete"]))
+        self.output("  Locked (no access)  : {}\n".format(summary["locked"]))
+        self.output("  Error verifying     : {}\n".format(summary["error"]))
+
+        incompletes = [p for p in report_posts if p["status"] == "incomplete"]
+        if incompletes:
+            self.output("\nIncomplete posts ({}):\n".format(len(incompletes)))
+            for p in incompletes[:30]:
+                self.output("  - {} ({} of {} files) {}  {}\n".format(
+                    p["post_id"],
+                    p["downloaded_files"], p["expected_files"],
+                    p["post_url"],
+                    (p.get("post_title") or "")[:40],
+                ))
+            if len(incompletes) > 30:
+                self.output("  ... and {} more (see JSON report).\n".format(len(incompletes) - 30))
+
+        if output_json:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(output_json)), exist_ok=True)
+            except Exception:
+                pass
+            with open(output_json, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            self.output("\nReport written to: {}\n".format(output_json))
+
+        if auto_fix and incompletes:
+            self.output("\nRe-downloading {} incomplete posts...\n".format(len(incompletes)))
+            for p in incompletes:
+                pid = p["post_id"]
+                # Force download_post to actually re-check this post even if its
+                # row in `posts` has download_complete=1 from a prior run.
+                try:
+                    self.db.update_post_download_complete(pid, 0)
+                except Exception:
+                    pass
+                try:
+                    self.download_post(pid)
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    if self.continue_on_error:
+                        self.output("Encountered an error redownloading post {}. Skipping...\n".format(pid))
+                        traceback.print_exc()
+                        continue
+                    raise
+
+        return report
+
+    def _verify_post_inner(self, post_id):
+        """Verify a single post; return one entry for the report."""
+        post_html_response = self.session.get(POST_URL.format(post_id))
+        post_html_response.raise_for_status()
+        post_html = BeautifulSoup(post_html_response.text, "html.parser")
+        csrf_meta = post_html.select_one("meta[name=\"csrf-token\"]")
+        headers = {"X-Requested-With": "XMLHttpRequest"}
+        if csrf_meta and csrf_meta.get("content"):
+            headers["X-CSRF-Token"] = csrf_meta["content"]
+
+        response = self.session.get(POST_API.format(post_id), headers=headers)
+        response.raise_for_status()
+        post_json = json.loads(response.text)["post"]
+
+        post_title = post_json.get("title") or ""
+        post_contents = post_json.get("post_contents") or []
+        total_contents = len(post_contents)
+        visible_count = 0
+        expected_urls = []
+
+        for content in post_contents:
+            if content.get("visible_status") != "visible":
+                continue
+            visible_count += 1
+            category = content.get("category")
+            if category == "photo_gallery":
+                for photo in content.get("post_content_photos", []) or []:
+                    url = (photo.get("url") or {}).get("original")
+                    if url:
+                        expected_urls.append(url)
+            elif category == "file":
+                if content.get("download_uri"):
+                    expected_urls.append(urljoin(POSTS_URL, content["download_uri"]))
+            elif category == "blog":
+                try:
+                    blog_json = json.loads(content.get("comment") or "{}")
+                    for op in blog_json.get("ops") or []:
+                        insert = op.get("insert")
+                        if isinstance(insert, dict) and insert.get("fantiaImage"):
+                            original_url = insert["fantiaImage"].get("original_url")
+                            if original_url:
+                                expected_urls.append(urljoin(BASE_URL, original_url))
+                except (ValueError, TypeError):
+                    pass
+            # 'embed' has no file we control; skip.
+
+        missing = []
+        for url in expected_urls:
+            url_path = unquote(url.split("?", 1)[0])
+            if not self.db.is_url_downloaded(url_path):
+                missing.append(url)
+
+        if total_contents > 0 and visible_count == 0:
+            status = "locked"
+        elif not expected_urls:
+            # Visible but no downloadable file (embed-only / pure text) → not failure
+            status = "complete"
+        elif missing:
+            status = "incomplete"
+        else:
+            status = "complete"
+
+        return {
+            "post_id": str(post_id),
+            "post_title": post_title,
+            "post_url": POST_URL.format(post_id),
+            "status": status,
+            "total_contents": total_contents,
+            "visible_contents": visible_count,
+            "expected_files": len(expected_urls),
+            "downloaded_files": len(expected_urls) - len(missing),
+            "missing_files": missing,
+        }
 
     def download_fanclub(self, fanclub, limit=0):
         """Download a fanclub."""
@@ -355,6 +618,14 @@ class FantiaDownloader:
                 page_number += 1
 
     def perform_download(self, url, filepath, use_server_filename=False, append_server_extension=False):
+        """Perform a download for the specified URL, with outer cooldown retry."""
+        return self._cooldown_retry(
+            "download {}".format(url),
+            self._perform_download_inner,
+            url, filepath, use_server_filename=use_server_filename, append_server_extension=append_server_extension
+        )
+
+    def _perform_download_inner(self, url, filepath, use_server_filename=False, append_server_extension=False):
         """Perform a download for the specified URL while showing progress."""
         url_path = unquote(url.split("?", 1)[0])
         server_filename = os.path.basename(url_path)
@@ -502,6 +773,14 @@ class FantiaDownloader:
         self.perform_download(thumb_url, filename, use_server_filename=self.use_server_filenames)
 
     def download_post(self, post_id):
+        """Download a post to its own directory, with outer cooldown retry."""
+        return self._cooldown_retry(
+            "post {}".format(post_id),
+            self._download_post_inner,
+            post_id
+        )
+
+    def _download_post_inner(self, post_id):
         """Download a post to its own directory."""
         db_post = self.db.find_post(post_id)
         if self.db_bypass_post_check and self.db.conn and db_post and db_post["download_complete"]:
@@ -542,7 +821,7 @@ class FantiaDownloader:
         if self.db.conn and not db_post:
             self.db.insert_post(post_id, post_title, post_json["fanclub"]["id"], post_posted_at, post_converted_at)
 
-        post_directory_title = sanitize_for_path(str(post_id))
+        post_directory_title = self._format_post_directory_title(post_id, post_title, post_creator, post_json.get("fanclub", {}).get("id"))
 
         post_directory = os.path.join(self.directory, sanitize_for_path(post_creator), post_directory_title)
         os.makedirs(post_directory, exist_ok=True)

@@ -125,3 +125,8 @@ ENV/
 
 # Database
 *.db
+*.sqlite
+*.sqlite3
+
+# Local scratch / probe artifacts
+.scratch/
