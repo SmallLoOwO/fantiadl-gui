@@ -130,3 +130,8 @@ ENV/
 
 # Local scratch / probe artifacts
 .scratch/
+
+# Cookie files — NEVER commit these
+cookie.txt
+cookies.txt
+*.cookies.txt
