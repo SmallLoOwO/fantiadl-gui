@@ -1,4 +1,34 @@
 # FantiaDL
+
+> **Note — fork:** This is a low-maintenance fork of
+> [bitbybyte/fantiadl](https://github.com/bitbybyte/fantiadl) with a few
+> extras layered on top of the upstream CLI. Original work © 2018 bitbybyte,
+> MIT License (preserved in `LICENSE`). I won't actively maintain this — PRs
+> and issues may get attention occasionally.
+>
+> **What's added in this fork:**
+> - Robust retry & cooldown around 429 / connection errors so a single rate
+>   limit doesn't kill a long fanclub run (`--max-retries`,
+>   `--retry-backoff`, `--retry-backoff-max`, `--cooldown-seconds`,
+>   `--cooldown-attempts`)
+> - `--sleep-request` preventative throttle (a sleep before every HTTP
+>   request) — the simplest way to avoid 429 in the first place
+> - `--post-directory-format` for customizable per-post folder names
+>   (default `{post_id}_{post_title}`; restore old behavior with
+>   `--post-directory-format "{post_id}"`)
+> - `--verify` cross-check mode: for a fanclub, compare server posts vs
+>   local `--db` and report what's missing, optionally re-download the
+>   incomplete ones. Writes a JSON report (`--verify-json`).
+> - Simple tkinter GUI: run `python fantiadl_gui.py` (or build a single exe
+>   with `pyinstaller --onefile --noconsole --name fantiadl_gui
+>   --collect-submodules fantiadl fantiadl_gui.py`). Has tabs for download,
+>   verify, and advanced flags; can create a new SQLite DB from inside the UI.
+>
+> See the new flags in `--help` and the GUI itself for details. Everything
+> below this note is the original upstream README, unmodified.
+>
+> ---
+
 Download media and other data from Fantia fanclubs and posts. A session cookie must be provided with the -c/--cookie argument directly or by passing the path to a legacy Netscape cookies file. Please see the [About Session Cookies](#about-session-cookies) section.
 
 ```
