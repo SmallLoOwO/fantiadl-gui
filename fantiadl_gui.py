@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """fantiadl GUI - simple tkinter frontend."""
 
+import json
 import os
 import queue
 import re
@@ -10,6 +11,20 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+SETTINGS_VERSION = 1
+MAX_URL_HISTORY = 5
+
+
+def settings_path():
+    """Per-user config path. %APPDATA%\\fantiadl-gui\\settings.json on Windows,
+    $XDG_CONFIG_HOME/fantiadl-gui/settings.json (or ~/.config/...) elsewhere.
+    """
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "fantiadl-gui", "settings.json")
 
 # When the executable is invoked with this sentinel as argv[1], delegate to
 # the fantiadl CLI. Lets the bundled exe serve as both GUI and CLI.
@@ -42,6 +57,7 @@ class FantiadlGUI:
         self.last_report_path = None
 
         self._build_ui()
+        self._load_settings()
         self.root.after(80, self._drain_log_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -60,6 +76,11 @@ class FantiadlGUI:
         self.show_cookie_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(header, text="顯示", variable=self.show_cookie_var,
                         command=self._toggle_cookie).grid(row=0, column=3, padx=4)
+        self.remember_cookie_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(header, text="記住 Cookie（明文儲存到本地）",
+                        variable=self.remember_cookie_var,
+                        command=self._on_remember_cookie_toggled).grid(
+                            row=0, column=4, padx=4, sticky="w")
 
         ttk.Label(header, text="輸出資料夾:").grid(row=1, column=0, sticky="w", padx=4, pady=2)
         self.outdir_var = tk.StringVar(value=os.getcwd())
@@ -86,7 +107,9 @@ class FantiadlGUI:
 
         ttk.Label(tab_dl, text="URL (fanclub 或 post):").grid(row=0, column=0, sticky="w", padx=4, pady=2)
         self.dl_url_var = tk.StringVar()
-        ttk.Entry(tab_dl, textvariable=self.dl_url_var).grid(row=0, column=1, columnspan=2, sticky="ew", padx=4)
+        self.dl_url_history = []
+        self.dl_url_combo = ttk.Combobox(tab_dl, textvariable=self.dl_url_var)
+        self.dl_url_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=4)
 
         ttk.Label(tab_dl, text="限制 post 數 (0=全部):").grid(row=1, column=0, sticky="w", padx=4, pady=2)
         self.dl_limit_var = tk.StringVar(value="0")
@@ -114,7 +137,9 @@ class FantiadlGUI:
 
         ttk.Label(tab_v, text="Fanclub URL:").grid(row=0, column=0, sticky="w", padx=4, pady=2)
         self.v_url_var = tk.StringVar()
-        ttk.Entry(tab_v, textvariable=self.v_url_var).grid(row=0, column=1, columnspan=2, sticky="ew", padx=4)
+        self.v_url_history = []
+        self.v_url_combo = ttk.Combobox(tab_v, textvariable=self.v_url_var)
+        self.v_url_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=4)
 
         ttk.Label(tab_v, text="JSON 報告路徑\n(留空自動命名):").grid(row=1, column=0, sticky="w", padx=4, pady=2)
         self.v_json_var = tk.StringVar()
@@ -310,6 +335,11 @@ class FantiadlGUI:
         if self.dl_use_server_filenames_var.get():
             args.append("-s")
         args.append(url)
+        self._push_url_history(self.dl_url_history, self.dl_url_combo, url)
+        try:
+            self._save_settings()
+        except Exception:
+            pass
         self._spawn(args, label="下載")
 
     def _run_verify(self, auto_fix):
@@ -343,6 +373,11 @@ class FantiadlGUI:
                 outdir = self.outdir_var.get().strip() or os.getcwd()
                 self.last_report_path = os.path.join(outdir, "verify_{}.json".format(m.group(1)))
         args.append(url)
+        self._push_url_history(self.v_url_history, self.v_url_combo, url)
+        try:
+            self._save_settings()
+        except Exception:
+            pass
         self._spawn(args, label="驗證 ({})".format("補抓" if auto_fix else "只報告"))
 
     # ---------------------------------------------------- Subprocess
@@ -441,7 +476,134 @@ class FantiadlGUI:
                 self.proc.terminate()
             except Exception:
                 pass
+        try:
+            self._save_settings()
+        except Exception:
+            pass
         self.root.destroy()
+
+    # ---------------------------------------------------- Persistence
+
+    def _on_remember_cookie_toggled(self):
+        """When the user un-checks 'remember cookie', wipe the saved cookie
+        from disk on the spot rather than waiting for window close."""
+        if not self.remember_cookie_var.get():
+            try:
+                self._save_settings()
+            except Exception:
+                pass
+
+    def _push_url_history(self, history_list, combobox, url):
+        """Move/insert URL to the front of history, dedupe, cap at MAX_URL_HISTORY."""
+        if not url:
+            return
+        if url in history_list:
+            history_list.remove(url)
+        history_list.insert(0, url)
+        del history_list[MAX_URL_HISTORY:]
+        try:
+            combobox.configure(values=list(history_list))
+        except Exception:
+            pass
+
+    def _load_settings(self):
+        path = settings_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            # Corrupted file: keep defaults but tell the user via log
+            self._append_log("讀取設定失敗 ({}): {}\n".format(path, e))
+            return
+        if not isinstance(data, dict):
+            return
+
+        remember = bool(data.get("remember_cookie"))
+        self.remember_cookie_var.set(remember)
+        if remember and isinstance(data.get("cookie"), str):
+            self.cookie_var.set(data["cookie"])
+
+        if isinstance(data.get("output_dir"), str) and data["output_dir"]:
+            self.outdir_var.set(data["output_dir"])
+        if isinstance(data.get("db_path"), str):
+            self.db_var.set(data["db_path"])
+
+        dl = data.get("download") or {}
+        if isinstance(dl, dict):
+            if isinstance(dl.get("url"), str):
+                self.dl_url_var.set(dl["url"])
+            hist = dl.get("url_history") or []
+            if isinstance(hist, list):
+                self.dl_url_history = [u for u in hist if isinstance(u, str)][:MAX_URL_HISTORY]
+                self.dl_url_combo.configure(values=list(self.dl_url_history))
+            if isinstance(dl.get("limit"), str):
+                self.dl_limit_var.set(dl["limit"])
+            for key, var in (("continue_on_error", self.dl_continue_var),
+                             ("dump_metadata", self.dl_metadata_var),
+                             ("thumb", self.dl_thumb_var),
+                             ("use_server_filenames", self.dl_use_server_filenames_var)):
+                if isinstance(dl.get(key), bool):
+                    var.set(dl[key])
+
+        vf = data.get("verify") or {}
+        if isinstance(vf, dict):
+            if isinstance(vf.get("url"), str):
+                self.v_url_var.set(vf["url"])
+            hist = vf.get("url_history") or []
+            if isinstance(hist, list):
+                self.v_url_history = [u for u in hist if isinstance(u, str)][:MAX_URL_HISTORY]
+                self.v_url_combo.configure(values=list(self.v_url_history))
+            if isinstance(vf.get("json_path"), str):
+                self.v_json_var.set(vf["json_path"])
+            if isinstance(vf.get("limit"), str):
+                self.v_limit_var.set(vf["limit"])
+
+        adv = data.get("advanced") or {}
+        if isinstance(adv, dict):
+            for key, var in self.adv_vars.items():
+                val = adv.get(key)
+                if isinstance(val, str):
+                    var.set(val)
+
+    def _save_settings(self):
+        path = settings_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        data = {
+            "version": SETTINGS_VERSION,
+            "remember_cookie": bool(self.remember_cookie_var.get()),
+            # cookie persisted only when opted-in; otherwise stored as empty
+            "cookie": self.cookie_var.get() if self.remember_cookie_var.get() else "",
+            "output_dir": self.outdir_var.get(),
+            "db_path": self.db_var.get(),
+            "download": {
+                "url": self.dl_url_var.get(),
+                "url_history": list(self.dl_url_history),
+                "limit": self.dl_limit_var.get(),
+                "continue_on_error": bool(self.dl_continue_var.get()),
+                "dump_metadata": bool(self.dl_metadata_var.get()),
+                "thumb": bool(self.dl_thumb_var.get()),
+                "use_server_filenames": bool(self.dl_use_server_filenames_var.get()),
+            },
+            "verify": {
+                "url": self.v_url_var.get(),
+                "url_history": list(self.v_url_history),
+                "json_path": self.v_json_var.get(),
+                "limit": self.v_limit_var.get(),
+            },
+            "advanced": {k: v.get() for k, v in self.adv_vars.items()},
+        }
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            self._append_log("寫入設定失敗 ({}): {}\n".format(path, e))
 
 
 def main():
