@@ -210,10 +210,46 @@ class FantiadlGUI:
         self.cookie_entry.configure(show="" if self.show_cookie_var.get() else "*")
 
     def _browse_cookie(self):
-        path = filedialog.askopenfilename(title="選擇 cookies.txt",
-                                          filetypes=[("cookies.txt", "*.txt"), ("All files", "*.*")])
-        if path:
+        path = filedialog.askopenfilename(
+            title="選擇 cookies.txt 或包含 _session_id 的純文字檔",
+            filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                head = f.read(4096)
+        except Exception as e:
+            messagebox.showerror("讀取失敗", "無法讀取檔案:\n{}".format(e))
+            return
+
+        first_line = head.split("\n", 1)[0].strip()
+        # Netscape cookies.txt: starts with a `#` comment header, or its data
+        # lines are tab-separated. fantiadl knows to load such files via
+        # http.cookiejar.MozillaCookieJar, so pass the path through unchanged.
+        is_netscape = (
+            first_line.startswith("# Netscape HTTP Cookie File")
+            or first_line.startswith("# HTTP Cookie File")
+            or "\t" in first_line
+        )
+        if is_netscape:
             self.cookie_var.set(path)
+            self._append_log("Cookie 設為 Netscape 檔路徑: {}\n".format(path))
+            return
+
+        # Otherwise, treat the file content as a raw _session_id value.
+        content = head.strip()
+        if not content:
+            messagebox.showerror("檔案為空", "選擇的檔案沒有內容。")
+            return
+        # Tolerate "_session_id=xxxxx" prefix and grab the first whitespace token
+        if content.startswith("_session_id="):
+            content = content[len("_session_id="):]
+        content = content.split()[0] if content.split() else ""
+        if not content:
+            messagebox.showerror("找不到 cookie", "在檔案內找不到可用的 cookie 值。")
+            return
+        self.cookie_var.set(content)
+        self._append_log("Cookie 從檔案讀入 (前 16 字元: {}…)\n".format(content[:16]))
 
     def _browse_outdir(self):
         path = filedialog.askdirectory(title="選擇輸出資料夾")
@@ -510,12 +546,29 @@ class FantiadlGUI:
         path = settings_path()
         if not os.path.isfile(path):
             return
+        # An empty file (0 byte) is not an error — it just means there's
+        # nothing saved yet. Treat it the same as 'no file' to avoid a
+        # noisy "Expecting value: line 1 column 1" each launch.
+        try:
+            if os.path.getsize(path) == 0:
+                return
+        except OSError:
+            return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception as e:
-            # Corrupted file: keep defaults but tell the user via log
-            self._append_log("讀取設定失敗 ({}): {}\n".format(path, e))
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            # File is corrupted. Move it aside (one-time backup) and fall
+            # back to defaults silently so the GUI still starts cleanly.
+            backup = path + ".broken"
+            try:
+                if os.path.exists(backup):
+                    os.remove(backup)
+                os.replace(path, backup)
+                self._append_log(
+                    "舊設定檔損毀，已備份為 {}，本次使用預設值。\n".format(os.path.basename(backup)))
+            except Exception:
+                self._append_log("設定檔無法解析 ({})；本次使用預設值。\n".format(type(e).__name__))
             return
         if not isinstance(data, dict):
             return
