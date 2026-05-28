@@ -181,6 +181,17 @@ class FantiadlGUI:
             ttk.Entry(tab_a, textvariable=var, width=40).grid(row=i, column=1, sticky="ew", padx=4)
             if hint:
                 ttk.Label(tab_a, text=hint, foreground="#666").grid(row=i, column=2, sticky="w", padx=4)
+
+        # post-order: dropdown rather than free-text Entry
+        order_row = len(adv_defs)
+        ttk.Label(tab_a, text="post-order (post 走訪順序)").grid(row=order_row, column=0, sticky="w", padx=4, pady=2)
+        self.adv_vars["post_order"] = tk.StringVar(value="newest")
+        ttk.Combobox(tab_a, textvariable=self.adv_vars["post_order"],
+                     values=["newest", "oldest", "api"], state="readonly", width=12).grid(
+                         row=order_row, column=1, sticky="w", padx=4)
+        ttk.Label(tab_a, text="newest=最新 ID 在前（建議）; oldest=最舊在前; api=Fantia 列表原序",
+                  foreground="#666").grid(row=order_row, column=2, sticky="w", padx=4)
+
         tab_a.columnconfigure(1, weight=1)
 
         # ---- Log + control bar ----
@@ -337,6 +348,7 @@ class FantiadlGUI:
             "cooldown_attempts":     "--cooldown-attempts",
             "post_directory_format": "--post-directory-format",
             "max_title_length":      "--max-title-length",
+            "post_order":            "--post-order",
         }
         for key, flag in adv_flag_map.items():
             val = self.adv_vars[key].get().strip()

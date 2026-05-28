@@ -64,6 +64,9 @@ naming_group = cmdl_parser.add_argument_group("naming options")
 naming_group.add_argument("--post-directory-format", dest="post_directory_format", default="{post_id}_{post_title}", help="format string for per-post folder name. Fields: {post_id} {post_title} {post_creator} {fanclub_id}. Default: '{post_id}_{post_title}'. Pass '{post_id}' to restore old ID-only behavior.")
 naming_group.add_argument("--max-title-length", dest="max_title_length", type=int, default=80, help="truncate the formatted folder name to this many characters to keep Windows MAX_PATH safe (default: 80; 0 disables)")
 
+order_group = cmdl_parser.add_argument_group("ordering options")
+order_group.add_argument("--post-order", dest="post_order", choices=["newest", "oldest", "api"], default="newest", help="order to walk posts in a fanclub (affects both download and --verify). 'newest' = highest post_id first (default), 'oldest' = lowest first, 'api' = whatever Fantia's listing page returned (no sort).")
+
 
 cmdl_opts = cmdl_parser.parse_args()
 
@@ -95,7 +98,7 @@ def main():
     #         password = getpass.getpass("Password: ")
 
     try:
-        downloader = FantiaDownloader(session_arg=session_arg, dump_metadata=cmdl_opts.dump_metadata, parse_for_external_links=cmdl_opts.parse_for_external_links, download_thumb=cmdl_opts.download_thumb, directory=cmdl_opts.output_path, quiet=cmdl_opts.quiet, continue_on_error=cmdl_opts.continue_on_error, use_server_filenames=cmdl_opts.use_server_filenames, mark_incomplete_posts=cmdl_opts.mark_incomplete_posts, month_limit=cmdl_opts.month_limit, exclude_file=cmdl_opts.exclude_file, db_path=cmdl_opts.db_path, db_bypass_post_check=cmdl_opts.db_bypass_post_check, max_retries=cmdl_opts.max_retries, retry_backoff=cmdl_opts.retry_backoff, retry_backoff_max=cmdl_opts.retry_backoff_max, cooldown_seconds=cmdl_opts.cooldown_seconds, cooldown_attempts=cmdl_opts.cooldown_attempts, sleep_request=cmdl_opts.sleep_request, post_directory_format=cmdl_opts.post_directory_format, max_title_length=cmdl_opts.max_title_length)
+        downloader = FantiaDownloader(session_arg=session_arg, dump_metadata=cmdl_opts.dump_metadata, parse_for_external_links=cmdl_opts.parse_for_external_links, download_thumb=cmdl_opts.download_thumb, directory=cmdl_opts.output_path, quiet=cmdl_opts.quiet, continue_on_error=cmdl_opts.continue_on_error, use_server_filenames=cmdl_opts.use_server_filenames, mark_incomplete_posts=cmdl_opts.mark_incomplete_posts, month_limit=cmdl_opts.month_limit, exclude_file=cmdl_opts.exclude_file, db_path=cmdl_opts.db_path, db_bypass_post_check=cmdl_opts.db_bypass_post_check, max_retries=cmdl_opts.max_retries, retry_backoff=cmdl_opts.retry_backoff, retry_backoff_max=cmdl_opts.retry_backoff_max, cooldown_seconds=cmdl_opts.cooldown_seconds, cooldown_attempts=cmdl_opts.cooldown_attempts, sleep_request=cmdl_opts.sleep_request, post_directory_format=cmdl_opts.post_directory_format, max_title_length=cmdl_opts.max_title_length, post_order=cmdl_opts.post_order)
         if cmdl_opts.download_fanclubs:
             try:
                 downloader.download_followed_fanclubs(limit=cmdl_opts.limit)

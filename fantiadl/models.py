@@ -67,7 +67,7 @@ class FantiaClub:
 
 
 class FantiaDownloader:
-    def __init__(self, session_arg, chunk_size=1024 * 1024 * 5, dump_metadata=False, parse_for_external_links=False, download_thumb=False, directory=None, quiet=True, continue_on_error=False, use_server_filenames=False, mark_incomplete_posts=False, month_limit=None, exclude_file=None, db_path=None, db_bypass_post_check=False, max_retries=10, retry_backoff=3, retry_backoff_max=120, cooldown_seconds=60, cooldown_attempts=10, sleep_request=0.0, post_directory_format="{post_id}_{post_title}", max_title_length=80):
+    def __init__(self, session_arg, chunk_size=1024 * 1024 * 5, dump_metadata=False, parse_for_external_links=False, download_thumb=False, directory=None, quiet=True, continue_on_error=False, use_server_filenames=False, mark_incomplete_posts=False, month_limit=None, exclude_file=None, db_path=None, db_bypass_post_check=False, max_retries=10, retry_backoff=3, retry_backoff_max=120, cooldown_seconds=60, cooldown_attempts=10, sleep_request=0.0, post_directory_format="{post_id}_{post_title}", max_title_length=80, post_order="newest"):
         # self.email = email
         # self.password = password
         self.session_arg = session_arg
@@ -93,6 +93,7 @@ class FantiaDownloader:
         self.sleep_request = sleep_request
         self.post_directory_format = post_directory_format
         self.max_title_length = max_title_length
+        self.post_order = post_order
 
         self.initialize_session()
         self.login()
@@ -612,10 +613,29 @@ class FantiaDownloader:
                     new_post_ids.append(post_id)
             all_posts += new_post_ids
             if not posts or (not new_post_ids and post_found): # No new posts found and we've already collected a post
-                self.output("Collected {} posts.\n".format(len(all_posts)))
-                return all_posts
+                ordered = self._sort_post_ids(all_posts)
+                self.output("Collected {} posts (order: {}).\n".format(len(ordered), self.post_order))
+                return ordered
             else:
                 page_number += 1
+
+    def _sort_post_ids(self, post_ids):
+        """Sort post IDs according to self.post_order.
+
+        Fantia's `/fanclubs/<id>/posts?page=N` returns posts roughly newest
+        first but it's not strictly guaranteed (edited posts, pinned items,
+        scheduled posts can shift order). Sorting by numeric id gives a
+        predictable, monotonic order so --limit / Ctrl+C behavior matches
+        user intent ("抓最新 N 個" really means newest N).
+        """
+        if self.post_order == "api":
+            return list(post_ids)
+        reverse = (self.post_order == "newest")
+        try:
+            return sorted(post_ids, key=lambda x: int(x), reverse=reverse)
+        except (ValueError, TypeError):
+            # Defensive fallback: lexical sort if any id isn't numeric.
+            return sorted(post_ids, reverse=reverse)
 
     def perform_download(self, url, filepath, use_server_filename=False, append_server_extension=False):
         """Perform a download for the specified URL, with outer cooldown retry."""
