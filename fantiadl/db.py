@@ -41,10 +41,19 @@ class FantiaDlDatabase:
         self.execute("REPLACE INTO posts VALUES (?, ?, ?, ?, ?, 0, ?)", (id, title, fanclub, posted_at, converted_at, int(time.time())))
 
     def insert_post_content(self, id, parent_post, title, category, price, price_unit):
-        self.execute("INSERT INTO post_contents VALUES (?, ?, ?, ?, ?, ?, ?)", (id, parent_post, title, category, price, price_unit, int(time.time())))
+        # OR IGNORE: re-running over an already-recorded post_content (e.g.
+        # during --verify + auto-fix) must not crash on the PK uniqueness
+        # check. The original metadata is preserved.
+        self.execute("INSERT OR IGNORE INTO post_contents VALUES (?, ?, ?, ?, ?, ?, ?)", (id, parent_post, title, category, price, price_unit, int(time.time())))
 
     def insert_url(self, url):
-        self.execute("INSERT INTO urls VALUES (?, ?)", (url, int(time.time())))
+        # OR IGNORE: marking a URL as downloaded is idempotent. Real-world
+        # cases where the same url_path arrives twice in one run:
+        #   - HTTP redirects rewrite url_path after the initial
+        #     is_url_downloaded() check (cc.fantia.jp → CDN, etc.).
+        #   - The same image is referenced from multiple posts.
+        # Either way: silently keep the earlier row's timestamp.
+        self.execute("INSERT OR IGNORE INTO urls VALUES (?, ?)", (url, int(time.time())))
 
     # SELECT
 
